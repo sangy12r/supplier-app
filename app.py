@@ -1,12 +1,27 @@
-import secrets, time
+import base64, os, secrets, time
 import pandas as pd
 import streamlit as st
 from d1 import q
 from mailer import send_mail
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
-NAVY = "#2a5a8c"
-st.markdown(f"<style>h1,h2,h3{{color:{NAVY}}}[data-testid=stMetricValue]{{color:{NAVY}}}</style>", unsafe_allow_html=True)
+NAVY, BLUE, TEAL, GREEN = "#1f4e79", "#2a5a8c", "#1fa3b5", "#2e9e6b"
+st.markdown(f"""<style>
+h1{{color:{NAVY};font-size:1.7rem!important}} h2,h3{{color:{BLUE}}}
+[data-testid=stSidebar]{{background:#eaf1f8}}
+.kpi{{background:#fff;border-radius:12px;padding:14px 18px;box-shadow:0 1px 6px rgba(0,0,0,.12);color:#5b6b7b;font-size:13px}}
+.kpi b{{display:block;font-size:34px;line-height:1.2}}
+.stButton button,.stDownloadButton button{{border-radius:8px}}
+</style>""", unsafe_allow_html=True)
+
+def banner():
+    logo = ""
+    if os.path.exists("logo.png"):
+        b = base64.b64encode(open("logo.png", "rb").read()).decode()
+        logo = f'<img src="data:image/png;base64,{b}" style="height:46px;background:#fff;padding:6px 10px;border-radius:8px;margin-right:18px">'
+    st.markdown(f'<div style="background:linear-gradient(90deg,{NAVY},{BLUE} 60%,{TEAL});padding:22px 28px;border-radius:14px;display:flex;align-items:center;margin-bottom:18px">{logo}<div><div style="color:#fff;font-size:26px;font-weight:700">Supplier Code of Conduct</div><div style="color:#dbe9f6;font-size:14px">Awareness Campaign Tracker · Wilhelmsen Port Services</div></div></div>', unsafe_allow_html=True)
+
+banner()
 
 if not st.session_state.get("ok"):
     st.title("Supplier Code of Conduct – Tracker")
@@ -43,13 +58,14 @@ if st.sidebar.button("Refresh"): st.rerun()
 df = load()
 
 if page == "Dashboard":
-    st.title("Supplier Code of Conduct – Awareness Campaign")
     n = len(df)
     sent = int((df.sends > 0).sum()) if n else 0
     started = int((df.first_click.notna() | df.signed_off_at.notna()).sum()) if n else 0
     done = int((df.status == "Signed off").sum()) if n else 0
-    for col, (lbl, v) in zip(st.columns(4), [("Suppliers", n), ("Emails sent", sent), ("Course started", started), ("Signed off", done)]):
-        col.metric(lbl, v)
+    cards = [("Suppliers", n, NAVY), ("Emails sent", sent, BLUE), ("Course started", started, TEAL), ("Signed off", done, GREEN)]
+    for col, (lbl, v, c) in zip(st.columns(4), cards):
+        col.markdown(f'<div class="kpi" style="border-top:5px solid {c}">{lbl}<b style="color:{c}">{v}</b></div>', unsafe_allow_html=True)
+    st.write("")
     if n:
         st.progress(done / n, text=f"Sign-off completion: {done / n:.0%}")
     st.caption("Course started = someone clicked the supplier's link (a forwarded email counts under the original supplier). Signed off comes from the Microsoft Form list you upload on the Import sign-offs page.")
@@ -63,7 +79,11 @@ if page == "Dashboard":
         out = pd.DataFrame({"Company": v.company, "Contact": v.contact_name, "Email": v.email, "Status": v.status,
                             "Emails sent": v.sends, "Last sent": ist(v.last_sent), "Course started": ist(v.first_click),
                             "Signed off": ist(v.signed_off_at)})
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        SC = {"Not sent": "#e6eaef", "Sent": "#d5e6f6", "Course started": "#cdeef2", "Signed off": "#d3f0e1"}
+        sty = out.style
+        paint = sty.map if hasattr(sty, "map") else sty.applymap
+        st.dataframe(paint(lambda s: f"background-color:{SC.get(s, '')};color:#1b2a3a;font-weight:600", subset=["Status"]),
+                     use_container_width=True, hide_index=True)
         st.download_button("Download CSV", out.to_csv(index=False), "supplier_tracker.csv")
         st.subheader("Recent activity")
         ev = pd.DataFrame(q("SELECT s.company,s.email,COUNT(*) clicks,MAX(e.ts) ts FROM events e JOIN suppliers s ON s.token=e.token WHERE e.type='click' GROUP BY s.id ORDER BY MAX(e.ts) DESC LIMIT 25"),
