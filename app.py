@@ -66,11 +66,11 @@ if page == "Dashboard":
         st.dataframe(out, use_container_width=True, hide_index=True)
         st.download_button("Download CSV", out.to_csv(index=False), "supplier_tracker.csv")
         st.subheader("Recent activity")
-        ev = pd.DataFrame(q("SELECT s.company,s.email,e.type,e.ts FROM events e JOIN suppliers s ON s.token=e.token WHERE e.type='click' ORDER BY e.id DESC LIMIT 25"),
-                          columns=["company", "email", "type", "ts"])
+        ev = pd.DataFrame(q("SELECT s.company,s.email,COUNT(*) clicks,MAX(e.ts) ts FROM events e JOIN suppliers s ON s.token=e.token WHERE e.type='click' GROUP BY s.id ORDER BY MAX(e.ts) DESC LIMIT 25"),
+                          columns=["company", "email", "clicks", "ts"])
         if len(ev):
-            ev["type"] = ev["type"].map({"click": "Course started"})
             ev["ts"] = ist(ev["ts"])
+            ev.columns = ["Company", "Email", "Clicks", "Latest click"]
             st.dataframe(ev, use_container_width=True, hide_index=True)
 
 elif page == "Suppliers":
