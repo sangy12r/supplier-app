@@ -5,6 +5,19 @@ from d1 import q
 from mailer import send_mail
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
+
+# Hide Streamlit's built-in menu/header/footer for every viewer, on every page.
+# Also set via [client] toolbarMode in .streamlit/config.toml.
+st.markdown(
+    """
+    <style>
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 NAVY, BLUE, TEAL, GREEN = "#1f4e79", "#2a5a8c", "#1fa3b5", "#2e9e6b"
 st.markdown(f"""<style>
 h1{{color:{NAVY};font-size:1.7rem!important}} h2,h3{{color:{BLUE}}}
