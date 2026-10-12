@@ -108,25 +108,48 @@ if page == "Dashboard":
 
 elif page == "Suppliers":
     st.title("Suppliers")
-    up = st.file_uploader("Upload list (Excel/CSV with columns: company, contact_name, email)", type=["xlsx", "csv"])
-    if up and st.button("Import"):
-        d = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
-        d.columns = [c.strip().lower() for c in d.columns]
-        added = 0
-        for r in d.itertuples():
-            em = str(getattr(r, "email", "")).strip().lower()
-            if "@" not in em: continue
-            q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)",
-              [str(getattr(r, "company", "")), str(getattr(r, "contact_name", "")), em, secrets.token_urlsafe(8)])
-            added += 1
-        st.success(f"Processed {added} rows (duplicates by email are ignored)")
-        st.rerun()
-    with st.form("add"):
-        c1, c2, c3 = st.columns(3)
-        co, nm, em = c1.text_input("Company"), c2.text_input("Contact name"), c3.text_input("Email")
-        if st.form_submit_button("Add supplier") and "@" in em:
-            q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)", [co, nm, em.strip().lower(), secrets.token_urlsafe(8)])
+    tab_add, tab_del = st.tabs(["Add suppliers", "Delete suppliers"])
+    with tab_add:
+        up = st.file_uploader("Upload list (Excel/CSV with columns: company, contact_name, email)", type=["xlsx", "csv"])
+        if up and st.button("Import"):
+            d = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+            d.columns = [c.strip().lower() for c in d.columns]
+            added = 0
+            for r in d.itertuples():
+                em = str(getattr(r, "email", "")).strip().lower()
+                if "@" not in em: continue
+                q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)",
+                  [str(getattr(r, "company", "")), str(getattr(r, "contact_name", "")), em, secrets.token_urlsafe(8)])
+                added += 1
+            st.success(f"Processed {added} rows (duplicates by email are ignored)")
             st.rerun()
+        with st.form("add"):
+            c1, c2, c3 = st.columns(3)
+            co, nm, em = c1.text_input("Company"), c2.text_input("Contact name"), c3.text_input("Email")
+            if st.form_submit_button("Add supplier") and "@" in em:
+                q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)", [co, nm, em.strip().lower(), secrets.token_urlsafe(8)])
+                st.rerun()
+    with tab_del:
+        if len(df):
+            label = {r.email: f"{r.company or '-'}  |  {r.email}" for r in df.itertuples()}
+            with st.form("del", clear_on_submit=True):
+                sel = st.multiselect("Choose suppliers to delete", list(label), format_func=lambda e: label[e])
+                sure = st.checkbox("Yes, delete the selected suppliers and their history permanently")
+                go = st.form_submit_button("Delete selected")
+            if go:
+                if sel and sure:
+                    for r in df[df.email.isin(sel)].itertuples():
+                        q("DELETE FROM events WHERE token=?", [r.token])
+                        q("DELETE FROM sends WHERE supplier_id=?", [int(r.id)])
+                        q("DELETE FROM suppliers WHERE id=?", [int(r.id)])
+                    st.success(f"Deleted {len(sel)} supplier(s)")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("Choose at least one supplier and tick the box to confirm.")
+        else:
+            st.info("There are no suppliers to delete.")
+    st.subheader("All suppliers")
     st.dataframe(df[["company", "contact_name", "email", "status"]], use_container_width=True, hide_index=True)
 
 elif page == "Send & Follow-up":
