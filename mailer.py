@@ -1,6 +1,7 @@
 import smtplib, streamlit as st
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 
 SUBJECT = "Partnership Commitment – Complying with the Supplier Code of Conduct"
 
@@ -26,13 +27,31 @@ def build_html(token):
 <p>Best regards,<br>Global Procurement Team<br>Wilhelmsen Port Services</p>
 </div>"""
 
+def build_text(token):
+    s = st.secrets
+    base = s["TRACK_BASE"].rstrip("/")
+    deadline = s.get("DEADLINE", "18 December 2025")
+    return (
+        "Dear Partners and Suppliers,\n\n"
+        "As part of our commitment to safe, responsible and ethical business, Wilhelmsen is running an "
+        "awareness campaign on the Supplier Code of Conduct.\n\n"
+        f"Please complete the awareness session using the link below by {deadline}:\n"
+        f"{base}/c/{token}\n\n"
+        "Compliance concerns can be reported to wps.global.compliance@wilhelmsen.com.\n"
+        "Comments and feedback: wps.supplier.governance@wilhelmsen.com\n\n"
+        "Best regards,\nGlobal Procurement Team\nWilhelmsen Port Services\n"
+    )
+
 def send_mail(to, token, reminder=False):
     s = st.secrets
     msg = MIMEMultipart("alternative")
     msg["Subject"] = ("Reminder: " if reminder else "") + SUBJECT
     msg["From"] = f"{s.get('FROM_NAME', 'Wilhelmsen Port Services')} <{s['SMTP_USER']}>"
     msg["To"] = to
-    msg.attach(MIMEText(build_html(token), "html"))
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.attach(MIMEText(build_text(token), "plain", "utf-8"))
+    msg.attach(MIMEText(build_html(token), "html", "utf-8"))
     with smtplib.SMTP(s.get("SMTP_HOST", "smtp.gmail.com"), int(s.get("SMTP_PORT", 587))) as srv:
         srv.starttls()
         srv.login(s["SMTP_USER"], s["SMTP_PASS"])
