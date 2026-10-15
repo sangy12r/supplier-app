@@ -2,7 +2,6 @@ import base64, os, secrets, time
 import pandas as pd
 import streamlit as st
 from d1 import q
-from mailer import send_mail
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
 
@@ -81,7 +80,7 @@ if page == "Dashboard":
     st.write("")
     if n:
         st.progress(done / n, text=f"Sign-off completion: {done / n:.0%}")
-    st.caption("Course started = someone opened the supplier's link and pressed the Start button (a forwarded email counts under the original supplier). Signed off comes from the Microsoft Form list you upload on the Import sign-offs page.")
+    st.caption("Course started = the supplier entered their email on the start page and pressed the Start button. Signed off comes from the Microsoft Form list you upload on the Import sign-offs page.")
     if n:
         f1, f2 = st.columns([2, 1])
         stat_f = f1.multiselect("Status", ["Not sent", "Sent", "Course started", "Signed off"])
@@ -105,6 +104,23 @@ if page == "Dashboard":
             ev["ts"] = ist(ev["ts"])
             ev.columns = ["Company", "Email", "Clicks", "Latest click"]
             st.dataframe(ev, use_container_width=True, hide_index=True)
+
+    st.subheader("Unlisted visitors")
+    st.caption("People who started the course with an email that is not in your supplier list (for example a forwarded invitation or a typo).")
+    try:
+        uv = pd.DataFrame(q("SELECT email,COUNT(*) starts,MIN(ts) first_ts,MAX(ts) last_ts FROM visitors GROUP BY email ORDER BY MAX(ts) DESC"),
+                          columns=["email", "starts", "first_ts", "last_ts"])
+    except Exception:
+        uv = None
+        st.info("The visitors table is not set up yet. Run the one-time setup SQL in D1 to enable this section.")
+    if uv is not None:
+        if len(uv):
+            uv["first_ts"], uv["last_ts"] = ist(uv["first_ts"]), ist(uv["last_ts"])
+            uv.columns = ["Email", "Times started", "First started", "Latest start"]
+            st.dataframe(uv, use_container_width=True, hide_index=True)
+            st.download_button("Download unlisted visitors CSV", uv.to_csv(index=False), "unlisted_visitors.csv")
+        else:
+            st.write("No unlisted visitors yet.")
 
 elif page == "Suppliers":
     st.title("Suppliers")
@@ -154,27 +170,37 @@ elif page == "Suppliers":
 
 elif page == "Send & Follow-up":
     st.title("Send & Follow-up")
-    mode = st.radio("Who to email", ["Not yet sent – initial email", "Sent but not signed off – reminder"])
-    reminder = mode.startswith("Sent")
-    if reminder:
-        days = st.number_input("Skip suppliers emailed within the last (days)", 0, 30, 3)
-        t = df[(df.sends > 0) & df.signed_off_at.isna()]
-        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
-        t = t[pd.to_datetime(t.last_sent) < cutoff]
+    st.write("Send the emails yourself from Outlook, then record them here with **Mark as sent** so the dashboard and reminder dates stay accurate.")
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    INIT = "Initial email – not yet sent"
+    R1 = "Reminder – sent, not started yet"
+    R2 = "Reminder – started, not signed off"
+    mode = st.radio("Who to email", [INIT, R1, R2])
+    reminder = mode != INIT
+    t = df[df.signed_off_at.isna()]
+    if mode == INIT:
+        t = t[t.sends == 0]
     else:
-        t = df[df.sends == 0]
-    picks = st.multiselect(f"Recipients ({len(t)} eligible)", t.email.tolist(), default=t.email.tolist())
-    st.caption("Tip: add yourself as a supplier first to test the email and tracking.")
-    if st.button(f"Send to {len(picks)} supplier(s)", disabled=not picks):
-        bar, ok = st.progress(0), 0
-        for i, r in enumerate(t[t.email.isin(picks)].itertuples()):
-            try:
-                send_mail(r.email, r.token, reminder); status = "ok"; ok += 1
-            except Exception as e:
-                status = f"error: {e}"[:200]; st.warning(f"{r.email}: {status}")
-            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), "reminder" if reminder else "initial", status])
-            bar.progress((i + 1) / len(picks)); time.sleep(1)
-        st.success(f"Sent {ok} of {len(picks)}")
+        days = st.number_input("Skip suppliers emailed within the last (days)", 0, 30, 3)
+        t = t[(t.sends > 0) & t.first_click.isna()] if mode == R1 else t[t.first_click.notna()]
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
+        last = pd.to_datetime(t.last_sent)
+        t = t[last.isna() | (last < cutoff)]
+    batch_size = st.number_input("Batch size (suppliers per Outlook email)", 1, 500, 100)
+    eligible = t.email.tolist()
+    picks = st.multiselect(f"Recipients ({len(eligible)} eligible)", eligible, default=eligible[:int(batch_size)])
+    if picks:
+        st.write("Copy these into the **BCC** field in Outlook:")
+        st.code("; ".join(picks), language=None)
+        sel = t[t.email.isin(picks)]
+        st.download_button("Download list (CSV)", sel[["company", "contact_name", "email"]].to_csv(index=False), "recipients.csv")
+    st.caption("After you have sent the email in Outlook, click the button below. The next batch will then appear.")
+    if st.button(f"Mark {len(picks)} supplier(s) as sent", disabled=not picks):
+        for r in t[t.email.isin(picks)].itertuples():
+            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), "reminder" if reminder else "initial", "ok"])
+        st.session_state["flash"] = f"Marked {len(picks)} supplier(s) as sent."
+        st.rerun()
 
 else:
     st.title("Import sign-offs")
