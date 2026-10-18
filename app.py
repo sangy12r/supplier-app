@@ -117,7 +117,32 @@ if page == "Dashboard":
         if len(uv):
             uv["first_ts"], uv["last_ts"] = ist(uv["first_ts"]), ist(uv["last_ts"])
             uv.columns = ["Email", "Times started", "First started", "Latest start"]
-            st.dataframe(uv, use_container_width=True, hide_index=True)
+            st.write("Tick the people you recognise, add their company, then add them to your supplier list. Their start time is kept.")
+            ed = uv.copy()
+            ed.insert(0, "Select", False)
+            ed["Company"], ed["Contact name"] = "", ""
+            with st.form("uv_form"):
+                edited = st.data_editor(ed, hide_index=True, use_container_width=True, key="uv_editor",
+                                        disabled=["Email", "Times started", "First started", "Latest start"])
+                b1, b2 = st.columns(2)
+                add_go = b1.form_submit_button("Add selected to supplier list")
+                drop_go = b2.form_submit_button("Discard selected (typos or tests)")
+            chosen = edited[edited["Select"]]
+            if (add_go or drop_go) and chosen.empty:
+                st.warning("Tick at least one person first.")
+            elif add_go or drop_go:
+                for _, r in chosen.iterrows():
+                    em = str(r["Email"]).strip().lower()
+                    if add_go:
+                        co = "" if pd.isna(r["Company"]) else str(r["Company"])
+                        nm = "" if pd.isna(r["Contact name"]) else str(r["Contact name"])
+                        q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)", [co, nm, em, secrets.token_urlsafe(8)])
+                        tok = q("SELECT token FROM suppliers WHERE email=?", [em])[0]["token"]
+                        q("INSERT INTO events(token,type,ua,ts) SELECT ?,'click',ua,ts FROM visitors WHERE email=?", [tok, em])
+                    q("DELETE FROM visitors WHERE email=?", [em])
+                st.success(f"{'Added' if add_go else 'Discarded'} {len(chosen)} visitor(s).")
+                time.sleep(1)
+                st.rerun()
             st.download_button("Download unlisted visitors CSV", uv.to_csv(index=False), "unlisted_visitors.csv")
         else:
             st.write("No unlisted visitors yet.")
