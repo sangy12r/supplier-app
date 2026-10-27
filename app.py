@@ -84,7 +84,7 @@ if page == "Dashboard":
     st.write("")
     if n:
         st.progress(done / n, text=f"Sign-off completion: {done / n:.0%}")
-    st.caption("Course started = the supplier submitted the Start form. Signed off = the supplier submitted the sign-off form. Both come from the Excel lists you upload on the Import lists page.")
+    st.caption("Course started = the supplier entered their email on the start page and pressed Start, which takes them into the course. Signed off = their sign-off form response, uploaded on the Import lists page.")
     if n:
         f1, f2 = st.columns([2, 1])
         stat_f = f1.multiselect("Status", ["Not sent", "Sent", "Course started", "Signed off"])
