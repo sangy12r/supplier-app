@@ -7,6 +7,8 @@ Secrets used (Streamlit -> Settings -> Secrets):
   SMTP_PASS   Mailjet password / secret key
   FROM_EMAIL  default "wps.supplier.governance@wilhelmsen.com" (must be an address Mailjet allows)
   FROM_NAME   default "WPS Supplier Governance"
+  REPLY_TO    optional, replies go here (e.g. the shared mailbox) instead of the sending address
+  SEND_DELAY_SECONDS  optional, pause between emails (default 0.5; use 2.5 for Microsoft 365 SMTP)
   TRACK_BASE  your worker address, e.g. https://supplier-link.sangy12r.workers.dev
   DEADLINE    optional, e.g. "18 December 2026" (left out of the email if not set)
   SCOC_URL    optional link to the Supplier Code of Conduct
@@ -85,6 +87,14 @@ def thankyou_content(name, subject, body_txt):
     return subject, body, html
 
 
+def describe_sender():
+    """Shows which settings are really in use (the key is partly hidden)."""
+    user = str(_secret("SMTP_USER", ""))
+    masked = (user[:4] + "..." + user[-2:]) if len(user) > 8 else user
+    return (f"Server: {_secret('SMTP_HOST', 'in-v3.mailjet.com')}:{_secret('SMTP_PORT', 587)} | "
+            f"Login: {masked} | From: {_secret('FROM_EMAIL', DEFAULT_FROM)}")
+
+
 def send_mail(to, subject, text, html):
     host = str(_secret("SMTP_HOST", "in-v3.mailjet.com"))
     port = int(_secret("SMTP_PORT", 587))
@@ -96,6 +106,9 @@ def send_mail(to, subject, text, html):
     msg["Subject"] = subject
     msg["From"] = formataddr((name, sender))
     msg["To"] = to
+    reply_to = str(_secret("REPLY_TO", "")).strip()
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
     msg.attach(MIMEText(text, "plain", "utf-8"))
@@ -108,7 +121,16 @@ def send_mail(to, subject, text, html):
         if port != 465:
             srv.starttls()
         srv.login(user, pwd)
-        srv.sendmail(sender, [to], msg.as_string())
+        code, resp = srv.mail(sender)
+        if code != 250:
+            raise smtplib.SMTPSenderRefused(code, resp, sender)
+        code, resp = srv.rcpt(to)
+        if code not in (250, 251):
+            raise smtplib.SMTPRecipientsRefused({to: (code, resp)})
+        code, resp = srv.data(msg.as_string())
+        if code != 250:
+            raise smtplib.SMTPDataError(code, resp)
+        return f"{code} " + (resp.decode("utf-8", "replace") if isinstance(resp, bytes) else str(resp))
     finally:
         try:
             srv.quit()
