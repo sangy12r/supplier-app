@@ -75,6 +75,26 @@ def log(action, detail):
 
 EMAIL_RE = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
 
+def read_table(up):
+    """Reads an uploaded .xlsx/.csv. Handles Excel/Microsoft Forms CSVs in any encoding and drops blank rows/columns."""
+    name = up.name.lower()
+    if not name.endswith(".csv"):
+        d = pd.read_excel(up)
+    else:
+        raw = up.getvalue()
+        d, last_err = None, None
+        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+            try:
+                d = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python")
+                break
+            except Exception as e:
+                last_err = e
+        if d is None:
+            raise last_err
+    d = d.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    d.columns = [str(c).strip() for c in d.columns]
+    return d
+
 def pick_email_col(d):
     # of the columns with "email" in the name, pick the one that really contains addresses
     # (ignores MS Forms built-in "Email" column when set to "anonymous")
@@ -251,7 +271,7 @@ elif page == "Suppliers":
     with tab_add:
         up = st.file_uploader("Upload list (Excel/CSV with columns: company, contact_name, email)", type=["xlsx", "csv"])
         if up and st.button("Import"):
-            d = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+            d = read_table(up)
             d.columns = [c.strip().lower() for c in d.columns]
             added = 0
             for r in d.itertuples():
@@ -445,7 +465,7 @@ else:
         is_start = kind.startswith("Start")
         up = st.file_uploader("Microsoft Forms responses (.xlsx or .csv)", type=["xlsx", "csv"])
         if up:
-            d = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+            d = read_table(up)
             guess_em = pick_email_col(d)
             c1, c2, c3 = st.columns(3)
             col = c1.selectbox("Email ID column", d.columns, index=guess_em)
