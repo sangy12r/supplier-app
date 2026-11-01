@@ -76,19 +76,33 @@ def log(action, detail):
 EMAIL_RE = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
 
 def read_table(up):
-    """Reads an uploaded .xlsx/.csv. Handles Excel/Microsoft Forms CSVs in any encoding and drops blank rows/columns."""
+    """Reads an uploaded .xlsx/.csv. Handles Excel/Microsoft Forms CSVs (any encoding, any separator,
+    trailing commas) and drops blank rows/columns."""
     name = up.name.lower()
     if not name.endswith(".csv"):
         d = pd.read_excel(up)
     else:
         raw = up.getvalue()
+        encs = ["utf-16"] if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else ["utf-8-sig", "cp1252", "latin-1"]
         d, last_err = None, None
-        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
-            try:
-                d = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python")
+        for enc in encs:
+            for sep in (",", ";", "\t"):
+                try:
+                    t = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=sep, index_col=False)
+                    if t.shape[1] > 1:
+                        d = t
+                        break
+                except Exception as e:
+                    last_err = e
+            if d is not None:
                 break
-            except Exception as e:
-                last_err = e
+        if d is None:
+            for enc in encs:  # last resort: skip any malformed lines
+                try:
+                    d = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="skip", index_col=False)
+                    break
+                except Exception as e:
+                    last_err = e
         if d is None:
             raise last_err
     d = d.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
