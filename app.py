@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from d1 import q
-from mailer import invite_content, thankyou_content, send_mail
+from mailer import invite_content, thankyou_content, send_mail, describe_sender
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
 
@@ -389,6 +389,7 @@ elif page == "Send & Follow-up":
             "Wilhelmsen Port Services\n"
             f"{SHARED_MAILBOX}"
         )
+        st.caption("Each supplier's email greets them by their saved contact name (for example 'Dear Ann,'). 'Dear Valued Partner' is used only when no name is saved.")
         subj = st.text_input("Email Subject", value=default_subj)
         body_txt = st.text_area("Email Body (2–3 lines Certificate of Completion)", value=default_body, height=180)
 
@@ -416,8 +417,9 @@ elif page == "Send & Follow-up":
     if st.button("Send test email", disabled=not (secrets_ok and test_to.strip())):
         try:
             ts, tx, th = content_for("Test Name")
-            send_mail(test_to.strip(), "[TEST] " + ts, tx, th)
-            st.success(f"Test email sent to {test_to.strip()}. Check your inbox (and Junk) before sending to suppliers.")
+            reply = send_mail(test_to.strip(), "[TEST] " + ts, tx, th)
+            st.success(f"The mail server accepted the test email for {test_to.strip()}. Check your inbox (and Junk). Accepted does not always mean delivered.")
+            st.code(f"{describe_sender()}\nServer reply: {reply}", language=None)
         except Exception as e:
             st.error(f"Test failed: {e}")
     sure = st.checkbox("Step 2: I checked the test email and want to send to the selected suppliers")
@@ -435,7 +437,10 @@ elif page == "Send & Follow-up":
                 fails.append(f"{r.email}: {status}")
             q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, status])
             bar.progress((i + 1) / len(rows_))
-            time.sleep(0.5)
+            try:
+                time.sleep(float(st.secrets.get("SEND_DELAY_SECONDS", 0.5)))
+            except Exception:
+                time.sleep(0.5)
         if mode == TY:
             log("Thank-you email sent", f"{ok} supplier(s) from {SHARED_MAILBOX}")
         st.session_state["flash"] = f"Sent {ok} of {len(rows_)} email(s)."
@@ -493,7 +498,25 @@ else:
             comp_col = None if comp_sel == "(none)" else comp_sel
             name_col = None if name_sel == "(none)" else name_sel
 
-            rows = email_rows(d, col, comp_col, name_col)
+            id_col = next((c for c in d.columns if str(c).strip().lower() == "id"), None)
+            last_id = None
+            if not is_start:
+                try:
+                    lr = q("SELECT detail FROM log WHERE action='Sign-off import checkpoint' ORDER BY id DESC LIMIT 1")
+                    if lr:
+                        v0 = lr[0]["detail"] if isinstance(lr[0], dict) else lr[0][0]
+                        last_id = int(float(v0))
+                except Exception:
+                    last_id = None
+            d_use = d
+            if not is_start and id_col is not None and last_id is not None:
+                new_only = st.checkbox(f"Only new responses (skip rows already imported; last imported Id = {last_id})", value=True)
+                if new_only:
+                    d_use = d[pd.to_numeric(d[id_col], errors="coerce") > last_id]
+            started_only = False
+            if not is_start:
+                started_only = st.checkbox("Only mark as signed off if the supplier started the course in this app (ignores older responses)", value=True)
+            rows = email_rows(d_use, col, comp_col, name_col)
             st.caption(f"Detected **{len(rows)}** unique valid email address(es) in the uploaded file.")
             st.dataframe(rows.head(10), use_container_width=True, hide_index=True)
 
@@ -508,6 +531,7 @@ else:
                     seen = set()
                 hit = new_unlisted = 0
                 unmatched = []
+                skipped_not_started = []
                 for r in rows.itertuples(index=False):
                     em = str(r.email).strip().lower()
                     co = str(r.company).strip() if pd.notna(r.company) else ""
@@ -521,6 +545,9 @@ else:
                             q("INSERT INTO visitors(email,ua) VALUES(?,?)", [em, "start form"])
                             new_unlisted += 1
                     else:
+                        if started_only and em not in clicked and em not in seen:
+                            skipped_not_started.append(em)
+                            continue
                         if em in known:
                             q("UPDATE suppliers SET signed_off_at=COALESCE(signed_off_at, CURRENT_TIMESTAMP), "
                               "company=CASE WHEN (company IS NULL OR company='') AND ? != '' THEN ? ELSE company END, "
@@ -539,6 +566,11 @@ else:
                     st.success(f"{hit} suppliers marked as started. {new_unlisted} new emails added to Unlisted visitors on the Dashboard.")
                 else:
                     st.session_state["unmatched_so"] = unmatched
+                    st.session_state["skipped_so"] = skipped_not_started
+                    if id_col is not None:
+                        mx = pd.to_numeric(d[id_col], errors="coerce").max()
+                        if pd.notna(mx):
+                            log("Sign-off import checkpoint", str(int(mx)))
                     st.success(f"{hit} supplier(s) marked as Signed Off! Go to 'Send & Follow-up' to send their Certificate of Completion thank-you email.")
                     time.sleep(1)
                     st.rerun()
@@ -559,6 +591,24 @@ else:
                 st.success(f"Added {len(pend)} people as signed off.")
                 time.sleep(1)
                 st.rerun()
+
+        skp = st.session_state.pop("skipped_so", None)
+        if skp and not is_start:
+            st.warning(f"{len(skp)} response(s) were ignored because those emails have not started the course in this app: " + ", ".join(skp[:20]) + (" ..." if len(skp) > 20 else ""))
+
+        with st.expander("Made a mistake? Remove a sign-off"):
+            signed = df[df.signed_off_at.notna()]
+            if len(signed):
+                rem = st.multiselect("Suppliers to change back to 'not signed off'", signed.email.tolist())
+                if st.button("Remove sign-off for selected", disabled=not rem):
+                    for em_ in rem:
+                        q("UPDATE suppliers SET signed_off_at=NULL WHERE LOWER(TRIM(email))=?", [str(em_).strip().lower()])
+                        log("Sign-off removed", em_)
+                    st.success(f"Removed sign-off for {len(rem)} supplier(s).")
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                st.write("Nobody is marked as signed off.")
 
     with tab_msform:
         st.subheader("Sign-Off Links & Embedded Microsoft Form")
