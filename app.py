@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from d1 import q
+from mailer import invite_content, thankyou_content, send_mail
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
 
@@ -309,9 +310,11 @@ elif page == "Suppliers":
 
 elif page == "Send & Follow-up":
     st.title("Send & Follow-up")
-    st.write(f"Send campaigns, reminders, or **Certificate of Completion thank-you emails** from your shared mailbox (`{SHARED_MAILBOX}`), then record them here with **Mark as sent**.")
+    st.write(f"Send invitations, reminders or **Certificate of Completion thank-you emails** straight from the shared mailbox (`{SHARED_MAILBOX}`). Each supplier gets their own email and the app records it automatically.")
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
+    if st.session_state.get("flash_warn"):
+        st.warning(st.session_state.pop("flash_warn"))
 
     INIT = "Initial email – not yet sent"
     R1 = "Reminder – sent, not started yet"
@@ -364,35 +367,64 @@ elif page == "Send & Follow-up":
             unsafe_allow_html=True,
         )
 
-    if picks:
-        st.write(f"**1. From field in Outlook:** `{SHARED_MAILBOX}`")
-        st.write("**2. Copy these into the BCC field in Outlook:**")
-        st.code("; ".join(picks), language=None)
-        sel = t[t.email.isin(picks)]
-        c_dl, c_mail = st.columns([1, 2])
-        c_dl.download_button("Download recipient list (CSV)", sel[["company", "contact_name", "email"]].to_csv(index=False), "recipients.csv")
-        if mode == TY:
-            mailto_Href = (
-                f"mailto:{SHARED_MAILBOX}"
-                f"?bcc={urllib.parse.quote(';'.join(picks))}"
-                f"&subject={urllib.parse.quote(subj)}"
-                f"&body={urllib.parse.quote(body_txt)}"
-            )
-            c_mail.markdown(
-                f'<a href="{mailto_Href}" style="display:inline-block;background:{GREEN};color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none;font-weight:600">Open Draft in Outlook ({len(picks)} BCC)</a>',
-                unsafe_allow_html=True,
-            )
+    kind_val = "thankyou" if mode == TY else ("reminder" if mode != INIT else "initial")
+    secrets_ok = all(k in st.secrets for k in ("SMTP_USER", "SMTP_PASS", "TRACK_BASE"))
 
-    st.caption("After you have sent the email in Outlook, click the button below so the dashboard records it.")
-    btn_label = f"Mark {len(picks)} supplier(s) as thank-you sent" if mode == TY else f"Mark {len(picks)} supplier(s) as sent"
-    if st.button(btn_label, disabled=not picks):
-        kind_val = "thankyou" if mode == TY else ("reminder" if mode != INIT else "initial")
-        for r in t[t.email.isin(picks)].itertuples():
-            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, "ok"])
+    def content_for(name):
         if mode == TY:
-            log("Thank-you email sent", f"{len(picks)} supplier(s) from {SHARED_MAILBOX}")
-        st.session_state["flash"] = f"Marked {len(picks)} supplier(s) as {'thank-you sent' if mode == TY else 'sent'}."
+            return thankyou_content(name, subj, body_txt)
+        return invite_content(name, reminder=(mode != INIT))
+
+    st.subheader("Send from the app")
+    if not secrets_ok:
+        st.info("To enable sending, add SMTP_USER, SMTP_PASS and TRACK_BASE in Streamlit Secrets (Settings > Secrets).")
+    test_to = st.text_input("Step 1: send a test email to your own address first")
+    if st.button("Send test email", disabled=not (secrets_ok and test_to.strip())):
+        try:
+            ts, tx, th = content_for("Test Name")
+            send_mail(test_to.strip(), "[TEST] " + ts, tx, th)
+            st.success(f"Test email sent to {test_to.strip()}. Check your inbox (and Junk) before sending to suppliers.")
+        except Exception as e:
+            st.error(f"Test failed: {e}")
+    sure = st.checkbox("Step 2: I checked the test email and want to send to the selected suppliers")
+    if st.button(f"Send to {len(picks)} supplier(s) now", disabled=not (secrets_ok and picks and sure)):
+        rows_ = list(t[t.email.isin(picks)].itertuples())
+        bar, ok, fails = st.progress(0), 0, []
+        for i, r in enumerate(rows_):
+            nm = "" if pd.isna(r.contact_name) else str(r.contact_name).strip()
+            try:
+                xs, xt, xh = content_for(nm)
+                send_mail(r.email, xs, xt, xh)
+                status = "ok"; ok += 1
+            except Exception as e:
+                status = f"error: {e}"[:200]
+                fails.append(f"{r.email}: {status}")
+            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, status])
+            bar.progress((i + 1) / len(rows_))
+            time.sleep(0.5)
+        if mode == TY:
+            log("Thank-you email sent", f"{ok} supplier(s) from {SHARED_MAILBOX}")
+        st.session_state["flash"] = f"Sent {ok} of {len(rows_)} email(s)."
+        if fails:
+            st.session_state["flash_warn"] = "These failed and were NOT marked as sent: " + " | ".join(fails[:10])
         st.rerun()
+
+    with st.expander("Prefer to send from Outlook yourself? (manual option)"):
+        if picks:
+            st.write(f"**1. From field in Outlook:** `{SHARED_MAILBOX}`")
+            st.write("**2. Copy these into the BCC field in Outlook:**")
+            st.code("; ".join(picks), language=None)
+            sel = t[t.email.isin(picks)]
+            st.download_button("Download recipient list (CSV)", sel[["company", "contact_name", "email"]].to_csv(index=False), "recipients.csv")
+        st.caption("After you have sent the email in Outlook, click the button below so the dashboard records it.")
+        btn_label = f"Mark {len(picks)} supplier(s) as thank-you sent" if mode == TY else f"Mark {len(picks)} supplier(s) as sent"
+        if st.button(btn_label, disabled=not picks):
+            for r in t[t.email.isin(picks)].itertuples():
+                q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, "ok"])
+            if mode == TY:
+                log("Thank-you email sent", f"{len(picks)} supplier(s) from {SHARED_MAILBOX}")
+            st.session_state["flash"] = f"Marked {len(picks)} supplier(s) as {'thank-you sent' if mode == TY else 'sent'}."
+            st.rerun()
 
 else:
     st.title("Sign-off & Import")
