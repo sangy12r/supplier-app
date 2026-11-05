@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from d1 import q
-from mailer import invite_content, thankyou_content, send_mail, describe_sender
+from mailer import invite_content, send_mail, describe_sender
 
 st.set_page_config(page_title="Supplier Code of Conduct Tracker", page_icon="🧭", layout="wide")
 
@@ -109,6 +109,45 @@ def read_table(up):
     d.columns = [str(c).strip() for c in d.columns]
     return d
 
+def map_supplier_cols(d):
+    """Finds the email, company and contact columns in an uploaded supplier list, whatever the headings are called."""
+    low = {c: str(c).strip().lower() for c in d.columns}
+    em = next((c for c, l in low.items() if "mail" in l), None)
+    if em is None:  # no heading with "mail": use the column that holds the most @ signs
+        best, em = 0, None
+        for c in d.columns:
+            n = int(d[c].astype(str).str.contains("@").sum())
+            if n > best:
+                best, em = n, c
+    co = next((c for c, l in low.items() if c != em and any(k in l for k in ("company", "supplier", "vendor", "organi", "firm"))), None)
+    nm = next((c for c, l in low.items() if c not in (em, co) and any(k in l for k in ("contact", "person", "name"))), None)
+    return em, co, nm
+
+def cell(r, col):
+    return "" if col is None or pd.isna(r[col]) else str(r[col]).strip()
+
+def supplier_template_bytes():
+    buf = io.BytesIO()
+    sample = pd.DataFrame({
+        "company": ["Example Shipping Pvt Ltd", "Sample Logistics LLC", ""],
+        "contact_name": ["Asha Rao", "John Smith", ""],
+        "email": ["asha.rao@example.com", "john.smith@example.com", ""],
+    })
+    howto = pd.DataFrame({"How to fill this sheet": [
+        "1. Keep the three headings in row 1 of the 'Suppliers' sheet: company, contact_name, email.",
+        "2. One supplier contact per row. Email is the only column that must be filled.",
+        "3. Delete the example rows, then paste your own list.",
+        "4. Save as .xlsx (or .csv) and upload it on the Suppliers page.",
+        "5. People already in the app are skipped, so you can upload the same list again safely.",
+    ]})
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        sample.to_excel(xw, sheet_name="Suppliers", index=False)
+        howto.to_excel(xw, sheet_name="How to fill", index=False)
+        for ws, widths in ((xw.sheets["Suppliers"], (34, 24, 36)), (xw.sheets["How to fill"], (100,))):
+            for i, w in enumerate(widths):
+                ws.column_dimensions["ABC"[i]].width = w
+    return buf.getvalue()
+
 def pick_email_col(d):
     # of the columns with "email" in the name, pick the one that really contains addresses
     # (ignores MS Forms built-in "Email" column when set to "anonymous")
@@ -136,7 +175,7 @@ def email_rows(d, col, comp_col=None, name_col=None):
 def ist(series):
     return pd.to_datetime(series, errors="coerce").dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.strftime("%d %b %Y %H:%M")
 
-page = st.sidebar.radio("Menu", ["Dashboard", "Suppliers", "Send & Follow-up", "Sign-off & Import"])
+page = st.sidebar.radio("Menu", ["Dashboard", "Suppliers", "Send & Follow-up", "Sign-offs"])
 if st.sidebar.button("Refresh"): st.rerun()
 df = load()
 
@@ -145,7 +184,6 @@ if page == "Dashboard":
     sent = int((df.sends > 0).sum()) if n else 0
     started = int((df.first_click.notna() | df.signed_off_at.notna()).sum()) if n else 0
     done = int((df.status == "Signed off").sum()) if n else 0
-    thanked = int(df.thankyou_at.notna().sum()) if n else 0
     waiting = int(((df.sends > 0) & df.first_click.isna() & df.signed_off_at.isna()).sum()) if n else 0
     cards = [
         ("Suppliers", n, NAVY),
@@ -153,14 +191,13 @@ if page == "Dashboard":
         ("Sent, not started", waiting, "#e8a317"),
         ("Course started", started, TEAL),
         ("Signed off", done, GREEN),
-        ("Thank-you sent", thanked, PURPLE),
     ]
-    for col, (lbl, v, c) in zip(st.columns(6), cards):
+    for col, (lbl, v, c) in zip(st.columns(5), cards):
         col.markdown(f'<div class="kpi" style="border-top:5px solid {c}">{lbl}<b style="color:{c}">{v}</b></div>', unsafe_allow_html=True)
     st.write("")
     if n:
-        st.progress(done / n, text=f"Sign-off completion: {done / n:.0%} ({done}/{n} signed off · {thanked}/{done if done else 0} thanked)")
-    st.caption("Course started = the supplier entered their email on the start page and pressed Start. Signed off = completed via the built-in /signoff page or uploaded from the Microsoft Sign-off Form.")
+        st.progress(done / n, text=f"Sign-off completion: {done / n:.0%} ({done}/{n} signed off)")
+    st.caption("Course started = the supplier entered their email on the start page and pressed Start. Signed off = the supplier submitted the sign-off page at the end of the course.")
     if n:
         f1, f2 = st.columns([2, 1])
         stat_f = f1.multiselect("Status", ["Not sent", "Sent", "Course started", "Signed off"])
@@ -177,7 +214,6 @@ if page == "Dashboard":
             "Last sent": ist(v.last_sent),
             "Course started": ist(v.first_click),
             "Signed off": ist(v.signed_off_at),
-            "Thank-you sent": ist(v.thankyou_at),
         })
         SC = {"Not sent": "#e6eaef", "Sent": "#d5e6f6", "Course started": "#cdeef2", "Signed off": "#d3f0e1"}
         sty = out.style
@@ -196,7 +232,6 @@ if page == "Dashboard":
                 "Last sent": ist(d.last_sent),
                 "Course started": ist(d.first_click),
                 "Signed off": ist(d.signed_off_at),
-                "Thank-you sent": ist(d.thankyou_at),
             })
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
@@ -281,21 +316,48 @@ if page == "Dashboard":
 
 elif page == "Suppliers":
     st.title("Suppliers")
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
     tab_add, tab_del = st.tabs(["Add suppliers", "Delete suppliers"])
     with tab_add:
-        up = st.file_uploader("Upload list (Excel/CSV with columns: company, contact_name, email)", type=["xlsx", "csv"])
-        if up and st.button("Import"):
-            d = read_table(up)
-            d.columns = [c.strip().lower() for c in d.columns]
-            added = 0
-            for r in d.itertuples():
-                em = str(getattr(r, "email", "")).strip().lower()
-                if "@" not in em: continue
-                q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)",
-                  [str(getattr(r, "company", "")), str(getattr(r, "contact_name", "")), em, secrets.token_urlsafe(8)])
-                added += 1
-            st.success(f"Processed {added} rows (duplicates by email are ignored)")
-            st.rerun()
+        st.download_button("Download blank Excel template", supplier_template_bytes(), "supplier_upload_template.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        up = st.file_uploader("Upload your supplier list (Excel or CSV). Headings with company, contact and email in them are understood.", type=["xlsx", "csv"])
+        if up:
+            d, em_c, co_c, nm_c = None, None, None, None
+            try:
+                d = read_table(up)
+                if any(re.search(EMAIL_RE, str(c)) for c in d.columns):  # file has no heading row: the first "heading" is really a supplier
+                    first = list(d.columns)
+                    d.columns = [f"column {i + 1}" for i in range(len(first))]
+                    d = pd.concat([pd.DataFrame([first], columns=d.columns), d], ignore_index=True)
+                em_c, co_c, nm_c = map_supplier_cols(d)
+            except Exception as e:
+                st.error(f"Could not read this file: {e}")
+            if d is not None and em_c is None:
+                st.error("I could not find an email column. Please use the template, or name the column 'email'.")
+            elif d is not None:
+                st.caption(f"Columns used: Email = '{em_c}', Company = '{co_c}', Contact = '{nm_c}'. First rows of your file:")
+                st.dataframe(d.head(5), use_container_width=True, hide_index=True)
+                if st.button("Import these suppliers"):
+                    known = {str(x).strip().lower() for x in df.email}
+                    new = existing = invalid = 0
+                    for _, r in d.iterrows():
+                        m_ = re.search(EMAIL_RE, str(r[em_c]))
+                        if not m_:
+                            invalid += 1
+                            continue
+                        em = m_.group(0).strip().lower()
+                        if em in known:
+                            existing += 1
+                            continue
+                        q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)",
+                          [cell(r, co_c), cell(r, nm_c), em, secrets.token_urlsafe(8)])
+                        known.add(em)
+                        new += 1
+                    log("Suppliers imported from file", f"{new} new, {existing} already in list, {invalid} without valid email")
+                    st.session_state["flash"] = f"Added {new} new supplier(s). {existing} were already in the list and {invalid} row(s) had no valid email."
+                    st.rerun()
         pasted = st.text_area("Or paste emails (from Outlook or Excel; any separator)", height=110)
         paste_co = st.text_input("Company for these emails (optional)")
         if st.button("Add pasted emails") and pasted.strip():
@@ -316,10 +378,10 @@ elif page == "Suppliers":
             label = {r.email: f"{r.company or '-'}  |  {r.email}" for r in df.itertuples()}
             with st.form("del", clear_on_submit=True):
                 sel = st.multiselect("Choose suppliers to delete", list(label), format_func=lambda e: label[e])
-                typed = st.text_input("Type DELETE to confirm (this removes their history permanently)")
+                sure_del = st.checkbox("Yes, delete the selected suppliers and their history permanently")
                 go = st.form_submit_button("Delete selected")
             if go:
-                if sel and typed.strip() == "DELETE":
+                if sel and sure_del:
                     for r in df[df.email.isin(sel)].itertuples():
                         log("Supplier deleted", f"{r.email} | emails sent: {r.sends} | status: {r.status}")
                         q("DELETE FROM events WHERE token=?", [r.token])
@@ -329,7 +391,7 @@ elif page == "Suppliers":
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.warning("Choose at least one supplier and type DELETE to confirm.")
+                    st.warning("Choose at least one supplier and tick the box to confirm.")
         else:
             st.info("There are no suppliers to delete.")
     st.subheader("All suppliers")
@@ -344,7 +406,7 @@ elif page == "Suppliers":
 
 elif page == "Send & Follow-up":
     st.title("Send & Follow-up")
-    st.write(f"Send invitations, reminders or **Certificate of Completion thank-you emails** straight from the shared mailbox (`{SHARED_MAILBOX}`). Each supplier gets their own email and the app records it automatically.")
+    st.write(f"Send the email from Outlook using the shared mailbox (`{SHARED_MAILBOX}`), then click **Mark as email sent** so the dashboard knows who has been emailed.")
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
     if st.session_state.get("flash_warn"):
@@ -353,281 +415,109 @@ elif page == "Send & Follow-up":
     INIT = "Initial email – not yet sent"
     R1 = "Reminder – sent, not started yet"
     R2 = "Reminder – started, not signed off"
-    TY = "Thank you / Certificate – signed off, not yet thanked"
+    mode = st.radio("Who to email", [INIT, R1, R2])
+    reminder = mode != INIT
+    kind_val = "reminder" if reminder else "initial"
 
-    mode = st.radio("Who to email", [INIT, R1, R2, TY])
-
-    if mode == TY:
-        include_already = st.checkbox("Include suppliers who were already sent a thank-you email", value=False)
-        t = df[df.signed_off_at.notna()] if include_already else df[df.signed_off_at.notna() & df.thankyou_at.isna()]
+    t = df[df.signed_off_at.isna()]
+    if mode == INIT:
+        t = t[t.sends == 0]
     else:
-        t = df[df.signed_off_at.isna()]
-        if mode == INIT:
-            t = t[t.sends == 0]
-        else:
-            days = st.number_input("Skip suppliers emailed within the last (days)", 0, 30, 3)
-            t = t[(t.sends > 0) & t.first_click.isna()] if mode == R1 else t[t.first_click.notna()]
-            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
-            last = pd.to_datetime(t.last_sent)
-            t = t[last.isna() | (last < cutoff)]
+        days = st.number_input("Skip suppliers emailed within the last (days)", 0, 30, 3)
+        t = t[(t.sends > 0) & t.first_click.isna()] if mode == R1 else t[t.first_click.notna()]
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
+        last = pd.to_datetime(t.last_sent)
+        t = t[last.isna() | (last < cutoff)]
 
     batch_size = st.number_input("Batch size (suppliers per Outlook email)", 1, 500, 100)
     eligible = t.email.tolist()
     picks = st.multiselect(f"Recipients ({len(eligible)} eligible)", eligible, default=eligible[:int(batch_size)])
 
-    if mode == TY:
-        st.subheader("Thank-You / Certificate of Completion Email Template")
-        st.caption(f"Send from Shared Mailbox: **{SHARED_MAILBOX}**")
-        default_subj = "Certificate of Completion – Wilhelmsen Port Services Supplier Code of Conduct"
-        default_body = (
-            "Dear Valued Partner,\n\n"
-            "Thank you for completing the Wilhelmsen Port Services Supplier Code of Conduct Awareness Session and submitting your Partnership Commitment sign-off. "
-            "This email serves as your official confirmation and Certificate of Completion, recognizing your organization's commitment to our shared GRC and compliance standards.\n\n"
-            "We appreciate your continued partnership and active support in upholding responsible business practices.\n\n"
-            "Best regards,\n"
-            "Supplier Governance Team\n"
-            "Wilhelmsen Port Services\n"
-            f"{SHARED_MAILBOX}"
-        )
-        st.caption("Each supplier's email greets them by their saved contact name (for example 'Dear Ann,'). 'Dear Valued Partner' is used only when no name is saved.")
-        subj = st.text_input("Email Subject", value=default_subj)
-        body_txt = st.text_area("Email Body (2–3 lines Certificate of Completion)", value=default_body, height=180)
+    st.subheader("Step 1: send from Outlook")
+    if picks:
+        st.write(f"From: `{SHARED_MAILBOX}`. Copy these into the **BCC** field:")
+        st.code("; ".join(picks), language=None)
+        sel = t[t.email.isin(picks)]
+        st.download_button("Download recipient list (CSV)", sel[["company", "contact_name", "email"]].to_csv(index=False), "recipients.csv")
+    else:
+        st.info("Nobody is eligible for this option right now.")
+    if "TRACK_BASE" in st.secrets:
+        with st.expander("Email subject and text to paste into Outlook"):
+            s0, t0, _h0 = invite_content("", reminder=reminder)
+            st.write("Subject:")
+            st.code(s0, language=None)
+            st.write("Body (plain text):")
+            st.code(t0, language=None)
 
-        st.markdown(
-            f"""<div class="cert-box">
-            <div style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:{TEAL};font-weight:700">Wilhelmsen Port Services · Certificate of Completion</div>
-            <div style="font-size:16px;font-weight:700;color:{NAVY};margin:4px 0 8px">Partnership Commitment – Complying with the Supplier Code of Conduct</div>
-            <div style="font-size:14px;line-height:1.55;white-space:pre-line">{body_txt}</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    kind_val = "thankyou" if mode == TY else ("reminder" if mode != INIT else "initial")
-    secrets_ok = all(k in st.secrets for k in ("SMTP_USER", "SMTP_PASS", "TRACK_BASE"))
-
-    def content_for(name):
-        if mode == TY:
-            return thankyou_content(name, subj, body_txt)
-        return invite_content(name, reminder=(mode != INIT))
-
-    st.subheader("Send from the app")
-    if not secrets_ok:
-        st.info("To enable sending, add SMTP_USER, SMTP_PASS and TRACK_BASE in Streamlit Secrets (Settings > Secrets).")
-    test_to = st.text_input("Step 1: send a test email to your own address first")
-    if st.button("Send test email", disabled=not (secrets_ok and test_to.strip())):
-        try:
-            ts, tx, th = content_for("Test Name")
-            reply = send_mail(test_to.strip(), "[TEST] " + ts, tx, th)
-            st.success(f"The mail server accepted the test email for {test_to.strip()}. Check your inbox (and Junk). Accepted does not always mean delivered.")
-            st.code(f"{describe_sender()}\nServer reply: {reply}", language=None)
-        except Exception as e:
-            st.error(f"Test failed: {e}")
-    sure = st.checkbox("Step 2: I checked the test email and want to send to the selected suppliers")
-    if st.button(f"Send to {len(picks)} supplier(s) now", disabled=not (secrets_ok and picks and sure)):
-        rows_ = list(t[t.email.isin(picks)].itertuples())
-        bar, ok, fails = st.progress(0), 0, []
-        for i, r in enumerate(rows_):
-            nm = "" if pd.isna(r.contact_name) else str(r.contact_name).strip()
-            try:
-                xs, xt, xh = content_for(nm)
-                send_mail(r.email, xs, xt, xh)
-                status = "ok"; ok += 1
-            except Exception as e:
-                status = f"error: {e}"[:200]
-                fails.append(f"{r.email}: {status}")
-            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, status])
-            bar.progress((i + 1) / len(rows_))
-            try:
-                time.sleep(float(st.secrets.get("SEND_DELAY_SECONDS", 0.5)))
-            except Exception:
-                time.sleep(0.5)
-        if mode == TY:
-            log("Thank-you email sent", f"{ok} supplier(s) from {SHARED_MAILBOX}")
-        st.session_state["flash"] = f"Sent {ok} of {len(rows_)} email(s)."
-        if fails:
-            st.session_state["flash_warn"] = "These failed and were NOT marked as sent: " + " | ".join(fails[:10])
+    st.subheader("Step 2: after you have sent it")
+    if st.button(f"Mark {len(picks)} supplier(s) as email sent", type="primary", disabled=not picks):
+        for r in t[t.email.isin(picks)].itertuples():
+            q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, "ok"])
+        log("Marked as email sent", f"{len(picks)} supplier(s) | {mode}")
+        st.session_state["flash"] = f"Marked {len(picks)} supplier(s) as email sent."
         st.rerun()
 
-    with st.expander("Prefer to send from Outlook yourself? (manual option)"):
-        if picks:
-            st.write(f"**1. From field in Outlook:** `{SHARED_MAILBOX}`")
-            st.write("**2. Copy these into the BCC field in Outlook:**")
-            st.code("; ".join(picks), language=None)
-            sel = t[t.email.isin(picks)]
-            st.download_button("Download recipient list (CSV)", sel[["company", "contact_name", "email"]].to_csv(index=False), "recipients.csv")
-        st.caption("After you have sent the email in Outlook, click the button below so the dashboard records it.")
-        btn_label = f"Mark {len(picks)} supplier(s) as thank-you sent" if mode == TY else f"Mark {len(picks)} supplier(s) as sent"
-        if st.button(btn_label, disabled=not picks):
-            for r in t[t.email.isin(picks)].itertuples():
-                q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, "ok"])
-            if mode == TY:
-                log("Thank-you email sent", f"{len(picks)} supplier(s) from {SHARED_MAILBOX}")
-            st.session_state["flash"] = f"Marked {len(picks)} supplier(s) as {'thank-you sent' if mode == TY else 'sent'}."
+    with st.expander("Marked by mistake? Undo 'email sent'"):
+        sent_df = df[(df.sends > 0) & df.signed_off_at.isna()]
+        if len(sent_df):
+            undo = st.multiselect("Suppliers to set back to 'not sent'", sent_df.email.tolist())
+            if st.button("Undo email sent for selected", disabled=not undo):
+                for r in df[df.email.isin(undo)].itertuples():
+                    q("DELETE FROM sends WHERE supplier_id=? AND (kind IS NULL OR kind!='thankyou')", [int(r.id)])
+                log("Email sent undone", ", ".join(undo))
+                st.session_state["flash"] = f"Set {len(undo)} supplier(s) back to 'not sent'."
+                st.rerun()
+        else:
+            st.write("Nobody is marked as sent.")
+
+    with st.expander("Optional: send from the app instead (only works once the Mailjet sender is fixed)"):
+        secrets_ok = all(k in st.secrets for k in ("SMTP_USER", "SMTP_PASS", "TRACK_BASE"))
+        if not secrets_ok:
+            st.info("To enable sending, add SMTP_USER, SMTP_PASS and TRACK_BASE in Streamlit Secrets (Settings > Secrets).")
+        test_to = st.text_input("Step A: send a test email to your own address first")
+        if st.button("Send test email", disabled=not (secrets_ok and test_to.strip())):
+            try:
+                ts, tx, th = invite_content("Test Name", reminder=reminder)
+                reply = send_mail(test_to.strip(), "[TEST] " + ts, tx, th)
+                st.success(f"The mail server accepted the test email for {test_to.strip()}. Check your inbox (and Junk). Accepted does not always mean delivered.")
+                st.code(f"{describe_sender()}\nServer reply: {reply}", language=None)
+            except Exception as e:
+                st.error(f"Test failed: {e}")
+        sure = st.checkbox("Step B: I checked the test email and want to send to the selected suppliers")
+        if st.button(f"Send to {len(picks)} supplier(s) now", disabled=not (secrets_ok and picks and sure)):
+            rows_ = list(t[t.email.isin(picks)].itertuples())
+            bar, ok, fails = st.progress(0), 0, []
+            for i, r in enumerate(rows_):
+                nm = "" if pd.isna(r.contact_name) else str(r.contact_name).strip()
+                try:
+                    xs, xt, xh = invite_content(nm, reminder=reminder)
+                    send_mail(r.email, xs, xt, xh)
+                    status = "ok"
+                    ok += 1
+                except Exception as e:
+                    status = f"error: {e}"[:200]
+                    fails.append(f"{r.email}: {status}")
+                q("INSERT INTO sends(supplier_id,kind,status) VALUES(?,?,?)", [int(r.id), kind_val, status])
+                bar.progress((i + 1) / len(rows_))
+                try:
+                    time.sleep(float(st.secrets.get("SEND_DELAY_SECONDS", 0.5)))
+                except Exception:
+                    time.sleep(0.5)
+            st.session_state["flash"] = f"Sent {ok} of {len(rows_)} email(s)."
+            if fails:
+                st.session_state["flash_warn"] = "These failed and were NOT marked as sent: " + " | ".join(fails[:10])
             st.rerun()
 
 else:
-    st.title("Sign-off & Import")
-    tab_sync, tab_msform, tab_manual = st.tabs([
-        "1. Upload MS Form Responses (Excel/CSV)",
-        "2. In-App Sign-Off Form (MS Form + Worker Link)",
-        "3. Manual / Direct Sign-Off",
-    ])
-
-    with tab_sync:
-        st.subheader("Import Microsoft Form Sign-Off or Start Responses")
-        st.write(
-            "Download the Excel file from your **Partnership commitment – Complying with the Supplier Code of Conduct** Microsoft Form and upload it here. "
-            "Suppliers are matched case-insensitively by their **Email ID** (`Please enter your Email ID`), and their Company & Contact Name are updated automatically."
-        )
-        st.markdown(f"🔗 **Open your Microsoft Form responses page:** [Partnership commitment – Complying with the Supplier Code of Conduct]({MS_SIGNOFF_FORM_URL})")
-        kind = st.radio("Which form is this?", ["Sign-off form – who signed off", "Start form – who started the course"])
-        is_start = kind.startswith("Start")
-        up = st.file_uploader("Microsoft Forms responses (.xlsx or .csv)", type=["xlsx", "csv"])
-        if up:
-            d = read_table(up)
-            guess_em = pick_email_col(d)
-            c1, c2, c3 = st.columns(3)
-            col = c1.selectbox("Email ID column", d.columns, index=guess_em)
-            comp_default = pick_col_by_keywords(d, ["company"])
-            comp_opts = ["(none)"] + list(d.columns)
-            comp_sel = c2.selectbox("Company column", comp_opts, index=comp_opts.index(comp_default) if comp_default in comp_opts else 0)
-            name_default = pick_col_by_keywords(d, ["full name", "contact", "your name"], exclude_exact=["name"])
-            name_opts = ["(none)"] + list(d.columns)
-            name_sel = c3.selectbox("Full Name column", name_opts, index=name_opts.index(name_default) if name_default in name_opts else 0)
-
-            comp_col = None if comp_sel == "(none)" else comp_sel
-            name_col = None if name_sel == "(none)" else name_sel
-
-            id_col = next((c for c in d.columns if str(c).strip().lower() == "id"), None)
-            last_id = None
-            if not is_start:
-                try:
-                    lr = q("SELECT detail FROM log WHERE action='Sign-off import checkpoint' ORDER BY id DESC LIMIT 1")
-                    if lr:
-                        v0 = lr[0]["detail"] if isinstance(lr[0], dict) else lr[0][0]
-                        last_id = int(float(v0))
-                except Exception:
-                    last_id = None
-            d_use = d
-            if not is_start and id_col is not None and last_id is not None:
-                new_only = st.checkbox(f"Only new responses (skip rows already imported; last imported Id = {last_id})", value=True)
-                if new_only:
-                    d_use = d[pd.to_numeric(d[id_col], errors="coerce") > last_id]
-            started_only = False
-            if not is_start:
-                started_only = st.checkbox("Only mark as signed off if the supplier started the course in this app (ignores older responses)", value=True)
-            rows = email_rows(d_use, col, comp_col, name_col)
-            st.caption(f"Detected **{len(rows)}** unique valid email address(es) in the uploaded file.")
-            st.dataframe(rows.head(10), use_container_width=True, hide_index=True)
-
-            auto_add_unlisted = st.checkbox("Automatically add signed-off suppliers even if their email wasn't in the original supplier list", value=True)
-
-            if st.button("Update dashboard with these responses", type="primary"):
-                known = {str(e).strip().lower(): tok for e, tok in zip(df.email, df.token)}
-                clicked = {str(e).strip().lower() for e in df[df.first_click.notna()].email}
-                try:
-                    seen = {str(r["email"]).strip().lower() for r in q("SELECT DISTINCT email FROM visitors")}
-                except Exception:
-                    seen = set()
-                hit = new_unlisted = 0
-                unmatched = []
-                skipped_not_started = []
-                for r in rows.itertuples(index=False):
-                    em = str(r.email).strip().lower()
-                    co = str(r.company).strip() if pd.notna(r.company) else ""
-                    nm = str(r.contact_name).strip() if pd.notna(r.contact_name) else ""
-                    if is_start:
-                        if em in known:
-                            if em not in clicked:
-                                q("INSERT INTO events(token,type,ua) VALUES(?,'click','start form')", [known[em]])
-                                hit += 1
-                        elif em not in seen:
-                            q("INSERT INTO visitors(email,ua) VALUES(?,?)", [em, "start form"])
-                            new_unlisted += 1
-                    else:
-                        if started_only and em not in clicked and em not in seen:
-                            skipped_not_started.append(em)
-                            continue
-                        if em in known:
-                            q("UPDATE suppliers SET signed_off_at=COALESCE(signed_off_at, CURRENT_TIMESTAMP), "
-                              "company=CASE WHEN (company IS NULL OR company='') AND ? != '' THEN ? ELSE company END, "
-                              "contact_name=CASE WHEN (contact_name IS NULL OR contact_name='') AND ? != '' THEN ? ELSE contact_name END "
-                              "WHERE LOWER(TRIM(email))=?", [co, co, nm, nm, em])
-                            hit += 1
-                        elif auto_add_unlisted:
-                            q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token,signed_off_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
-                              [co, nm, em, secrets.token_urlsafe(8)])
-                            q("UPDATE suppliers SET signed_off_at=COALESCE(signed_off_at, CURRENT_TIMESTAMP) WHERE LOWER(TRIM(email))=?", [em])
-                            log("Signed-off person added to supplier list", f"{em} | company: {co}")
-                            hit += 1
-                        else:
-                            unmatched.append((em, co, nm))
-                if is_start:
-                    st.success(f"{hit} suppliers marked as started. {new_unlisted} new emails added to Unlisted visitors on the Dashboard.")
-                else:
-                    st.session_state["unmatched_so"] = unmatched
-                    st.session_state["skipped_so"] = skipped_not_started
-                    if id_col is not None:
-                        mx = pd.to_numeric(d[id_col], errors="coerce").max()
-                        if pd.notna(mx):
-                            log("Sign-off import checkpoint", str(int(mx)))
-                    st.success(f"{hit} supplier(s) marked as Signed Off! Go to 'Send & Follow-up' to send their Certificate of Completion thank-you email.")
-                    time.sleep(1)
-                    st.rerun()
-
-        pend = st.session_state.get("unmatched_so")
-        if pend and not is_start:
-            st.subheader("Signed off, but not in your supplier list")
-            st.caption("These people completed the sign-off form with an email that is not in your list (for example a forwarded invitation).")
-            st.dataframe(pd.DataFrame(pend, columns=["Email", "Company (from the form)", "Full Name"]), use_container_width=True, hide_index=True)
-            if st.button("Add these people to the supplier list as signed off"):
-                for item in pend:
-                    em, co = item[0], item[1]
-                    nm = item[2] if len(item) > 2 else ""
-                    q("INSERT OR IGNORE INTO suppliers(company,contact_name,email,token) VALUES(?,?,?,?)", [co, nm, em, secrets.token_urlsafe(8)])
-                    q("UPDATE suppliers SET signed_off_at=COALESCE(signed_off_at, CURRENT_TIMESTAMP) WHERE LOWER(TRIM(email))=?", [em])
-                    log("Signed-off person added to supplier list", f"{em} | company: {co}")
-                st.session_state.pop("unmatched_so", None)
-                st.success(f"Added {len(pend)} people as signed off.")
-                time.sleep(1)
-                st.rerun()
-
-        skp = st.session_state.pop("skipped_so", None)
-        if skp and not is_start:
-            st.warning(f"{len(skp)} response(s) were ignored because those emails have not started the course in this app: " + ", ".join(skp[:20]) + (" ..." if len(skp) > 20 else ""))
-
-        with st.expander("Made a mistake? Remove a sign-off"):
-            signed = df[df.signed_off_at.notna()]
-            if len(signed):
-                rem = st.multiselect("Suppliers to change back to 'not signed off'", signed.email.tolist())
-                if st.button("Remove sign-off for selected", disabled=not rem):
-                    for em_ in rem:
-                        q("UPDATE suppliers SET signed_off_at=NULL WHERE LOWER(TRIM(email))=?", [str(em_).strip().lower()])
-                        log("Sign-off removed", em_)
-                    st.success(f"Removed sign-off for {len(rem)} supplier(s).")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.write("Nobody is marked as signed off.")
-
-    with tab_msform:
-        st.subheader("Sign-Off Links & Embedded Microsoft Form")
-        st.info(
-            "💡 **Want Sign-Off status to update automatically without uploading Excel files?**\n"
-            "Your updated `worker.js` now includes a built-in **`/signoff`** page with the exact same 3 questions as your Microsoft Form "
-            "(*Full name*, *Company name*, *Email ID*). Any supplier who submits `https://<your-worker>/signoff` is **instantly marked as Signed Off** in this app!"
-        )
-        st.write("**Microsoft Form Link:**")
-        st.code(MS_SIGNOFF_FORM_URL, language=None)
-        st.write("**Embedded Microsoft Sign-Off Form Preview:**")
-        components.iframe(MS_SIGNOFF_FORM_URL, height=700, scrolling=True)
-
+    st.title("Sign-offs")
+    st.write("Suppliers sign off by themselves on the sign-off page at the end of the course, and it appears on the Dashboard automatically. Use this page only to fix something.")
+    tab_manual, tab_fix = st.tabs(["Record a sign-off manually", "Remove a sign-off"])
     with tab_manual:
         st.subheader("Record Sign-Off Directly in the App")
         st.write("Mark an existing supplier as signed off, or enter a new supplier's sign-off directly.")
         with st.form("direct_signoff_form"):
             c1, c2, c3 = st.columns(3)
-            so_name = c1.text_input("1. Full name (optional)")
+            so_name = c1.text_input("1. Full name")
             so_comp = c2.text_input("2. Company name *")
             so_email = c3.text_input("3. Email ID *")
             so_submit = st.form_submit_button("Record Sign-Off Now")
@@ -657,3 +547,16 @@ else:
             st.success(f"Marked {m} as signed off.")
             time.sleep(1)
             st.rerun()
+    with tab_fix:
+        signed = df[df.signed_off_at.notna()]
+        if len(signed):
+            rem = st.multiselect("Suppliers to change back to 'not signed off'", signed.email.tolist())
+            if st.button("Remove sign-off for selected", disabled=not rem):
+                for em_ in rem:
+                    q("UPDATE suppliers SET signed_off_at=NULL WHERE LOWER(TRIM(email))=?", [str(em_).strip().lower()])
+                    log("Sign-off removed", em_)
+                st.success(f"Removed sign-off for {len(rem)} supplier(s).")
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.write("Nobody is marked as signed off.")
